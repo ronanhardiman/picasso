@@ -1,5 +1,5 @@
 Picasso
-========
+=======
 
 A powerful image downloading and caching library for Android
 
@@ -12,14 +12,27 @@ For more information please see [the website][1]
 Download
 --------
 
-Download [the latest JAR][2] or grab via Maven:
-
+Download [the latest JAR][2] or grab via Gradle:
+```groovy
+compile 'com.squareup.picasso:picasso:2.3.4'
+```
+or Maven:
 ```xml
 <dependency>
     <groupId>com.squareup.picasso</groupId>
     <artifactId>picasso</artifactId>
-    <version>(insert latest version)</version>
+    <version>2.3.4</version>
 </dependency>
+```
+
+
+ProGuard
+--------
+
+If you are using ProGuard make sure you add the following option:
+
+```
+-dontwarn com.squareup.okhttp.**
 ```
 
 

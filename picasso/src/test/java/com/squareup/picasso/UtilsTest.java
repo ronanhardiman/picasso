@@ -1,61 +1,80 @@
+/*
+ * Copyright (C) 2013 Square, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.squareup.picasso;
 
-import android.net.Uri;
-import java.util.ArrayList;
-import java.util.List;
+import android.content.res.Resources;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.annotation.Config;
 
+import static com.squareup.picasso.TestUtils.RESOURCE_ID_1;
+import static com.squareup.picasso.TestUtils.RESOURCE_ID_URI;
+import static com.squareup.picasso.TestUtils.RESOURCE_TYPE_URI;
+import static com.squareup.picasso.TestUtils.URI_1;
+import static com.squareup.picasso.TestUtils.mockPackageResourceContext;
 import static com.squareup.picasso.Utils.createKey;
+import static com.squareup.picasso.Utils.isWebPFile;
 import static com.squareup.picasso.Utils.parseResponseSourceHeader;
 import static org.fest.assertions.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
 
 @RunWith(RobolectricTestRunner.class)
 @Config(manifest = Config.NONE)
 public class UtilsTest {
-  private static final Uri URL = Uri.parse("http://example.com/a.png");
 
-  private Picasso picasso = mock(Picasso.class);
+  @Test public void matchingRequestsHaveSameKey() throws Exception {
+    Request request = new Request.Builder(URI_1).build();
+    String key1 = createKey(request);
+    String key2 = createKey(request);
+    assertThat(key1).isEqualTo(key2);
 
-  @Test public void matchingRequestsHaveSameKey() {
-    Request r1 = new Request(picasso, URL, 0, null, null, null, false, false, 0, null);
-    Request r2 = new Request(picasso, URL, 0, null, null, null, false, false, 0, null);
-    assertThat(createKey(r1)).isEqualTo(createKey(r2));
+    Transformation t1 = new TestTransformation("foo", null);
+    Transformation t2 = new TestTransformation("foo", null);
 
-    List<Transformation> t1 = new ArrayList<Transformation>();
-    t1.add(new TestTransformation("foo", null));
-    Request single1 = new Request(picasso, URL, 0, null, null, t1, false, false, 0, null);
-    List<Transformation> t2 = new ArrayList<Transformation>();
-    t2.add(new TestTransformation("foo", null));
-    Request single2 = new Request(picasso, URL, 0, null, null, t2, false, false, 0, null);
-    assertThat(createKey(single1)).isEqualTo(createKey(single2));
+    Request requestTransform1 = new Request.Builder(URI_1).transform(t1).build();
+    Request requestTransform2 = new Request.Builder(URI_1).transform(t2).build();
 
-    List<Transformation> t3 = new ArrayList<Transformation>();
-    t3.add(new TestTransformation("foo", null));
-    t3.add(new TestTransformation("bar", null));
-    Request double1 = new Request(picasso, URL, 0, null, null, t3, false, false, 0, null);
-    List<Transformation> t4 = new ArrayList<Transformation>();
-    t4.add(new TestTransformation("foo", null));
-    t4.add(new TestTransformation("bar", null));
-    Request double2 = new Request(picasso, URL, 0, null, null, t4, false, false, 0, null);
-    assertThat(createKey(double1)).isEqualTo(createKey(double2));
+    String single1 = createKey(requestTransform1);
+    String single2 = createKey(requestTransform2);
+    assertThat(single1).isEqualTo(single2);
 
-    List<Transformation> t5 = new ArrayList<Transformation>();
-    t5.add(new TestTransformation("foo", null));
-    t5.add(new TestTransformation("bar", null));
+    Transformation t3 = new TestTransformation("foo", null);
+    Transformation t4 = new TestTransformation("bar", null);
 
-    List<Transformation> t6 = new ArrayList<Transformation>();
-    t6.add(new TestTransformation("bar", null));
-    t6.add(new TestTransformation("foo", null));
-    Request order1 = new Request(picasso, URL, 0, null, null, t5, false, false, 0, null);
-    Request order2 = new Request(picasso, URL, 0, null, null, t6, false, false, 0, null);
-    assertThat(createKey(order1)).isNotEqualTo(createKey(order2));
+    Request requestTransform3 = new Request.Builder(URI_1).transform(t3).transform(t4).build();
+    Request requestTransform4 = new Request.Builder(URI_1).transform(t3).transform(t4).build();
+
+    String double1 = createKey(requestTransform3);
+    String double2 = createKey(requestTransform4);
+    assertThat(double1).isEqualTo(double2);
+
+    Transformation t5 = new TestTransformation("foo", null);
+    Transformation t6 = new TestTransformation("bar", null);
+
+    Request requestTransform5 = new Request.Builder(URI_1).transform(t5).transform(t6).build();
+    Request requestTransform6 = new Request.Builder(URI_1).transform(t6).transform(t5).build();
+
+    String order1 = createKey(requestTransform5);
+    String order2 = createKey(requestTransform6);
+    assertThat(order1).isNotEqualTo(order2);
   }
 
-  @Test public void loadedFromCache() {
+  @Test public void loadedFromCache() throws Exception {
     assertThat(parseResponseSourceHeader(null)).isFalse();
     assertThat(parseResponseSourceHeader("CACHE 200")).isTrue();
     assertThat(parseResponseSourceHeader("STREAM 200")).isFalse();
@@ -64,5 +83,37 @@ public class UtilsTest {
     assertThat(parseResponseSourceHeader("STREAM 304")).isFalse();
     assertThat(parseResponseSourceHeader("")).isFalse();
     assertThat(parseResponseSourceHeader("HELLO WORLD")).isFalse();
+  }
+
+  @Test public void detectedWebPFile() throws Exception {
+    assertThat(isWebPFile(new ByteArrayInputStream("RIFFxxxxWEBP".getBytes("US-ASCII")))).isTrue();
+    assertThat(
+        isWebPFile(new ByteArrayInputStream("RIFFxxxxxWEBP".getBytes("US-ASCII")))).isFalse();
+    assertThat(isWebPFile(new ByteArrayInputStream("ABCDxxxxWEBP".getBytes("US-ASCII")))).isFalse();
+    assertThat(isWebPFile(new ByteArrayInputStream("RIFFxxxxABCD".getBytes("US-ASCII")))).isFalse();
+    assertThat(isWebPFile(new ByteArrayInputStream("RIFFxxWEBP".getBytes("US-ASCII")))).isFalse();
+  }
+
+  @Test public void ensureBuilderIsCleared() throws Exception {
+    Request request1 = new Request.Builder(RESOURCE_ID_URI).build();
+    Request request2 = new Request.Builder(URI_1).build();
+    Utils.createKey(request1);
+    assertThat(Utils.MAIN_THREAD_KEY_BUILDER.length()).isEqualTo(0);
+    Utils.createKey(request2);
+    assertThat(Utils.MAIN_THREAD_KEY_BUILDER.length()).isEqualTo(0);
+  }
+
+  @Test public void getResourceById() throws IOException {
+    Request request = new Request.Builder(RESOURCE_ID_URI).build();
+    Resources resources = Utils.getResources(mockPackageResourceContext(), request);
+    int id = Utils.getResourceId(resources, request);
+    assertThat(id).isEqualTo(RESOURCE_ID_1);
+  }
+
+  @Test public void getResourceByTypeAndName() throws IOException {
+    Request request = new Request.Builder(RESOURCE_TYPE_URI).build();
+    Resources resources = Utils.getResources(mockPackageResourceContext(), request);
+    int id = Utils.getResourceId(resources, request);
+    assertThat(id).isEqualTo(RESOURCE_ID_1);
   }
 }

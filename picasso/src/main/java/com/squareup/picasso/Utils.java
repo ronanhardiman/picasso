@@ -1,18 +1,35 @@
+/*
+ * Copyright (C) 2013 Square, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.squareup.picasso;
 
+import android.annotation.TargetApi;
 import android.app.ActivityManager;
 import android.content.ContentResolver;
 import android.content.Context;
-import android.database.Cursor;
+import android.content.pm.PackageManager;
+import android.content.res.Resources;
 import android.graphics.Bitmap;
-import android.media.ExifInterface;
-import android.net.Uri;
-import android.os.Build;
 import android.os.Looper;
 import android.os.Process;
 import android.os.StatFs;
-import android.provider.MediaStore;
+import android.provider.Settings;
+import android.util.Log;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
@@ -20,48 +37,67 @@ import java.util.concurrent.ThreadFactory;
 
 import static android.content.Context.ACTIVITY_SERVICE;
 import static android.content.pm.ApplicationInfo.FLAG_LARGE_HEAP;
-import static android.media.ExifInterface.ORIENTATION_NORMAL;
-import static android.media.ExifInterface.ORIENTATION_ROTATE_180;
-import static android.media.ExifInterface.ORIENTATION_ROTATE_270;
-import static android.media.ExifInterface.ORIENTATION_ROTATE_90;
-import static android.media.ExifInterface.TAG_ORIENTATION;
 import static android.os.Build.VERSION.SDK_INT;
+import static android.os.Build.VERSION_CODES.HONEYCOMB;
 import static android.os.Build.VERSION_CODES.HONEYCOMB_MR1;
 import static android.os.Process.THREAD_PRIORITY_BACKGROUND;
-import static android.provider.ContactsContract.Contacts.openContactPhotoInputStream;
+import static android.provider.Settings.System.AIRPLANE_MODE_ON;
+import static com.squareup.picasso.Picasso.TAG;
+import static java.lang.String.format;
 
 final class Utils {
   static final String THREAD_PREFIX = "Picasso-";
   static final String THREAD_IDLE_NAME = THREAD_PREFIX + "Idle";
+  static final int DEFAULT_READ_TIMEOUT = 20 * 1000; // 20s
+  static final int DEFAULT_CONNECT_TIMEOUT = 15 * 1000; // 15s
   private static final String PICASSO_CACHE = "picasso-cache";
   private static final int KEY_PADDING = 50; // Determined by exact science.
   private static final int MIN_DISK_CACHE_SIZE = 5 * 1024 * 1024; // 5MB
   private static final int MAX_DISK_CACHE_SIZE = 50 * 1024 * 1024; // 50MB
-  private static final int MAX_MEM_CACHE_SIZE = 20 * 1024 * 1024; // 20MB
-  private static final String[] CONTENT_ORIENTATION = new String[] {
-      MediaStore.Images.ImageColumns.ORIENTATION
-  };
+
+  /** Thread confined to main thread for key creation. */
+  static final StringBuilder MAIN_THREAD_KEY_BUILDER = new StringBuilder();
+
+  /** Logging */
+  static final String OWNER_MAIN = "Main";
+  static final String OWNER_DISPATCHER = "Dispatcher";
+  static final String OWNER_HUNTER = "Hunter";
+  static final String VERB_CREATED = "created";
+  static final String VERB_CHANGED = "changed";
+  static final String VERB_IGNORED = "ignored";
+  static final String VERB_ENQUEUED = "enqueued";
+  static final String VERB_CANCELED = "canceled";
+  static final String VERB_BATCHED = "batched";
+  static final String VERB_RETRYING = "retrying";
+  static final String VERB_EXECUTING = "executing";
+  static final String VERB_DECODED = "decoded";
+  static final String VERB_TRANSFORMED = "transformed";
+  static final String VERB_JOINED = "joined";
+  static final String VERB_REMOVED = "removed";
+  static final String VERB_DELIVERED = "delivered";
+  static final String VERB_REPLAYING = "replaying";
+  static final String VERB_COMPLETED = "completed";
+  static final String VERB_ERRORED = "errored";
+  static final String VERB_PAUSED = "paused";
+  static final String VERB_RESUMED = "resumed";
+
+  /* WebP file header
+     0                   1                   2                   3
+     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |      'R'      |      'I'      |      'F'      |      'F'      |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |                           File Size                           |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    |      'W'      |      'E'      |      'B'      |      'P'      |
+    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  */
+  private static final int WEBP_FILE_HEADER_SIZE = 12;
+  private static final String WEBP_FILE_HEADER_RIFF = "RIFF";
+  private static final String WEBP_FILE_HEADER_WEBP = "WEBP";
 
   private Utils() {
     // No instances.
-  }
-
-  static int getContentProviderExifRotation(ContentResolver contentResolver, Uri uri) {
-    Cursor cursor = null;
-    try {
-      cursor = contentResolver.query(uri, CONTENT_ORIENTATION, null, null, null);
-      if (cursor == null || !cursor.moveToFirst()) {
-        return 0;
-      }
-      return cursor.getInt(0);
-    } catch (IllegalArgumentException ignored) {
-      // If the orientation column doesn't exist, assume no rotation.
-      return 0;
-    } finally {
-      if (cursor != null) {
-        cursor.close();
-      }
-    }
   }
 
   static int getBitmapBytes(Bitmap bitmap) {
@@ -77,78 +113,91 @@ final class Utils {
     return result;
   }
 
-  static int getFileExifRotation(String path) throws IOException {
-    ExifInterface exifInterface = new ExifInterface(path);
-    int orientation = exifInterface.getAttributeInt(TAG_ORIENTATION, ORIENTATION_NORMAL);
-    switch (orientation) {
-      case ORIENTATION_ROTATE_90:
-        return 90;
-      case ORIENTATION_ROTATE_180:
-        return 180;
-      case ORIENTATION_ROTATE_270:
-        return 270;
-      default:
-        return 0;
-    }
-  }
-
   static void checkNotMain() {
-    if (Looper.getMainLooper().getThread() == Thread.currentThread()) {
+    if (isMain()) {
       throw new IllegalStateException("Method call should not happen from the main thread.");
     }
   }
 
-  static String createKey(Request request) {
-    return createKey(request.uri, request.resourceId, request.options, request.transformations);
+  static void checkMain() {
+    if (!isMain()) {
+      throw new IllegalStateException("Method call should happen from the main thread.");
+    }
   }
 
-  static String createKey(Uri uri, int resourceId, PicassoBitmapOptions options,
-      List<Transformation> transformations) {
-    StringBuilder builder;
+  static boolean isMain() {
+    return Looper.getMainLooper().getThread() == Thread.currentThread();
+  }
 
-    if (uri != null) {
-      String path = uri.toString();
-      builder = new StringBuilder(path.length() + KEY_PADDING);
+  static String getLogIdsForHunter(BitmapHunter hunter) {
+    return getLogIdsForHunter(hunter, "");
+  }
+
+  static String getLogIdsForHunter(BitmapHunter hunter, String prefix) {
+    StringBuilder builder = new StringBuilder(prefix);
+    Action action = hunter.getAction();
+    if (action != null) {
+      builder.append(action.request.logId());
+    }
+    List<Action> actions = hunter.getActions();
+    if (actions != null) {
+      for (int i = 0, count = actions.size(); i < count; i++) {
+        if (i > 0 || action != null) builder.append(", ");
+        builder.append(actions.get(i).request.logId());
+      }
+    }
+    return builder.toString();
+  }
+
+  static void log(String owner, String verb, String logId) {
+    log(owner, verb, logId, "");
+  }
+
+  static void log(String owner, String verb, String logId, String extras) {
+    Log.d(TAG, format("%1$-11s %2$-12s %3$s %4$s", owner, verb, logId, extras));
+  }
+
+  static String createKey(Request data) {
+    String result = createKey(data, MAIN_THREAD_KEY_BUILDER);
+    MAIN_THREAD_KEY_BUILDER.setLength(0);
+    return result;
+  }
+
+  static String createKey(Request data, StringBuilder builder) {
+    if (data.stableKey != null) {
+      builder.ensureCapacity(data.stableKey.length() + KEY_PADDING);
+      builder.append(data.stableKey);
+    } else if (data.uri != null) {
+      String path = data.uri.toString();
+      builder.ensureCapacity(path.length() + KEY_PADDING);
       builder.append(path);
     } else {
-      builder = new StringBuilder(KEY_PADDING);
-      builder.append(resourceId);
+      builder.ensureCapacity(KEY_PADDING);
+      builder.append(data.resourceId);
     }
     builder.append('\n');
 
-    if (options != null) {
-      float targetRotation = options.targetRotation;
-      if (targetRotation != 0) {
-        builder.append("rotation:").append(targetRotation);
-        if (options.hasRotationPivot) {
-          builder.append('@').append(options.targetPivotX).append('x').append(options.targetPivotY);
-        }
-        builder.append('\n');
+    if (data.rotationDegrees != 0) {
+      builder.append("rotation:").append(data.rotationDegrees);
+      if (data.hasRotationPivot) {
+        builder.append('@').append(data.rotationPivotX).append('x').append(data.rotationPivotY);
       }
-      int targetWidth = options.targetWidth;
-      int targetHeight = options.targetHeight;
-      if (targetWidth != 0) {
-        builder.append("resize:").append(targetWidth).append('x').append(targetHeight);
-        builder.append('\n');
-      }
-      if (options.centerCrop) {
-        builder.append("centerCrop\n");
-      }
-      if (options.centerInside) {
-        builder.append("centerInside\n");
-      }
-      float targetScaleX = options.targetScaleX;
-      float targetScaleY = options.targetScaleY;
-      if (targetScaleX != 0) {
-        builder.append("scale:").append(targetScaleX).append('x').append(targetScaleY);
-        builder.append('\n');
-      }
+      builder.append('\n');
+    }
+    if (data.hasSize()) {
+      builder.append("resize:").append(data.targetWidth).append('x').append(data.targetHeight);
+      builder.append('\n');
+    }
+    if (data.centerCrop) {
+      builder.append("centerCrop\n");
+    } else if (data.centerInside) {
+      builder.append("centerInside\n");
     }
 
-    if (transformations != null) {
+    if (data.transformations != null) {
       //noinspection ForLoopReplaceableByForEach
-      for (int i = 0, count = transformations.size(); i < count; i++) {
-        builder.append(transformations.get(i).key());
+      for (int i = 0, count = data.transformations.size(); i < count; i++) {
+        builder.append(data.transformations.get(i).key());
         builder.append('\n');
       }
     }
@@ -156,20 +205,12 @@ final class Utils {
     return builder.toString();
   }
 
-  static void calculateInSampleSize(PicassoBitmapOptions options) {
-    final int height = options.outHeight;
-    final int width = options.outWidth;
-    final int reqHeight = options.targetHeight;
-    final int reqWidth = options.targetWidth;
-    int sampleSize = 1;
-    if (height > reqHeight || width > reqWidth) {
-      final int heightRatio = Math.round((float) height / (float) reqHeight);
-      final int widthRatio = Math.round((float) width / (float) reqWidth);
-      sampleSize = heightRatio < widthRatio ? heightRatio : widthRatio;
+  static void closeQuietly(InputStream is) {
+    if (is == null) return;
+    try {
+      is.close();
+    } catch (IOException ignored) {
     }
-
-    options.inSampleSize = sampleSize;
-    options.inJustDecodeBounds = false;
   }
 
   /** Returns {@code true} if header indicates the response body was loaded from the disk cache. */
@@ -191,53 +232,159 @@ final class Utils {
     }
   }
 
-  static Loader createDefaultLoader(Context context) {
+  static Downloader createDefaultDownloader(Context context) {
+    boolean okUrlFactory = false;
+    try {
+      Class.forName("com.squareup.okhttp.OkUrlFactory");
+      okUrlFactory = true;
+    } catch (ClassNotFoundException ignored) {
+    }
+
+    boolean okHttpClient = false;
     try {
       Class.forName("com.squareup.okhttp.OkHttpClient");
-      return OkHttpLoaderCreator.create(context);
-    } catch (ClassNotFoundException e) {
-      return new UrlConnectionLoader(context);
+      okHttpClient = true;
+    } catch (ClassNotFoundException ignored) {
     }
+
+    if (okHttpClient != okUrlFactory) {
+      throw new RuntimeException(""
+          + "Picasso detected an unsupported OkHttp on the classpath.\n"
+          + "To use OkHttp with this version of Picasso, you'll need:\n"
+          + "1. com.squareup.okhttp:okhttp:1.6.0 (or newer)\n"
+          + "2. com.squareup.okhttp:okhttp-urlconnection:1.6.0 (or newer)\n"
+          + "Note that OkHttp 2.0.0+ is supported!");
+    }
+
+    return okHttpClient
+        ? OkHttpLoaderCreator.create(context)
+        : new UrlConnectionDownloader(context);
+  }
+
+  static void sneakyRethrow(Throwable t) {
+    Utils.<Error>sneakyThrow2(t);
+  }
+
+  @SuppressWarnings("unchecked")
+  private static <T extends Throwable> void sneakyThrow2(Throwable t) throws T {
+    throw (T) t;
   }
 
   static File createDefaultCacheDir(Context context) {
     File cache = new File(context.getApplicationContext().getCacheDir(), PICASSO_CACHE);
     if (!cache.exists()) {
+      //noinspection ResultOfMethodCallIgnored
       cache.mkdirs();
     }
     return cache;
   }
 
-  static int calculateDiskCacheSize(File dir) {
-    StatFs statFs = new StatFs(dir.getAbsolutePath());
-    int available = statFs.getBlockCount() * statFs.getBlockSize();
-    // Target 2% of the total space.
-    int size = available / 50;
+  static long calculateDiskCacheSize(File dir) {
+    long size = MIN_DISK_CACHE_SIZE;
+
+    try {
+      StatFs statFs = new StatFs(dir.getAbsolutePath());
+      long available = ((long) statFs.getBlockCount()) * statFs.getBlockSize();
+      // Target 2% of the total space.
+      size = available / 50;
+    } catch (IllegalArgumentException ignored) {
+    }
+
     // Bound inside min/max size for disk cache.
     return Math.max(Math.min(size, MAX_DISK_CACHE_SIZE), MIN_DISK_CACHE_SIZE);
   }
 
   static int calculateMemoryCacheSize(Context context) {
-    ActivityManager am = (ActivityManager) context.getSystemService(ACTIVITY_SERVICE);
+    ActivityManager am = getService(context, ACTIVITY_SERVICE);
     boolean largeHeap = (context.getApplicationInfo().flags & FLAG_LARGE_HEAP) != 0;
     int memoryClass = am.getMemoryClass();
-    if (largeHeap && Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
+    if (largeHeap && SDK_INT >= HONEYCOMB) {
       memoryClass = ActivityManagerHoneycomb.getLargeMemoryClass(am);
     }
-    // Target 15% of the available RAM.
-    int size = 1024 * 1024 * memoryClass / 7;
-    // Bound to max size for mem cache.
-    return Math.min(size, MAX_MEM_CACHE_SIZE);
+    // Target ~15% of the available heap.
+    return 1024 * 1024 * memoryClass / 7;
   }
 
-  public static InputStream getContactPhotoStream(ContentResolver contentResolver, Uri uri) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.ICE_CREAM_SANDWICH) {
-      return openContactPhotoInputStream(contentResolver, uri);
+  static boolean isAirplaneModeOn(Context context) {
+    ContentResolver contentResolver = context.getContentResolver();
+    return Settings.System.getInt(contentResolver, AIRPLANE_MODE_ON, 0) != 0;
+  }
+
+  @SuppressWarnings("unchecked")
+  static <T> T getService(Context context, String service) {
+    return (T) context.getSystemService(service);
+  }
+
+  static boolean hasPermission(Context context, String permission) {
+    return context.checkCallingOrSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
+  }
+
+  static byte[] toByteArray(InputStream input) throws IOException {
+    ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+    byte[] buffer = new byte[1024 * 4];
+    int n;
+    while (-1 != (n = input.read(buffer))) {
+      byteArrayOutputStream.write(buffer, 0, n);
+    }
+    return byteArrayOutputStream.toByteArray();
+  }
+
+  static boolean isWebPFile(InputStream stream) throws IOException {
+    byte[] fileHeaderBytes = new byte[WEBP_FILE_HEADER_SIZE];
+    boolean isWebPFile = false;
+    if (stream.read(fileHeaderBytes, 0, WEBP_FILE_HEADER_SIZE) == WEBP_FILE_HEADER_SIZE) {
+      // If a file's header starts with RIFF and end with WEBP, the file is a WebP file
+      isWebPFile = WEBP_FILE_HEADER_RIFF.equals(new String(fileHeaderBytes, 0, 4, "US-ASCII"))
+          && WEBP_FILE_HEADER_WEBP.equals(new String(fileHeaderBytes, 8, 4, "US-ASCII"));
+    }
+    return isWebPFile;
+  }
+
+  static int getResourceId(Resources resources, Request data) throws FileNotFoundException {
+    if (data.resourceId != 0 || data.uri == null) {
+      return data.resourceId;
+    }
+
+    String pkg = data.uri.getAuthority();
+    if (pkg == null) throw new FileNotFoundException("No package provided: " + data.uri);
+
+    int id;
+    List<String> segments = data.uri.getPathSegments();
+    if (segments == null || segments.isEmpty()) {
+      throw new FileNotFoundException("No path segments: " + data.uri);
+    } else if (segments.size() == 1) {
+      try {
+        id = Integer.parseInt(segments.get(0));
+      } catch (NumberFormatException e) {
+        throw new FileNotFoundException("Last path segment is not a resource ID: " + data.uri);
+      }
+    } else if (segments.size() == 2) {
+      String type = segments.get(0);
+      String name = segments.get(1);
+
+      id = resources.getIdentifier(name, type, pkg);
     } else {
-      return ContactPhotoStreamIcs.get(contentResolver, uri);
+      throw new FileNotFoundException("More than two path segments: " + data.uri);
+    }
+    return id;
+  }
+
+  static Resources getResources(Context context, Request data) throws FileNotFoundException {
+    if (data.resourceId != 0 || data.uri == null) {
+      return context.getResources();
+    }
+
+    String pkg = data.uri.getAuthority();
+    if (pkg == null) throw new FileNotFoundException("No package provided: " + data.uri);
+    try {
+      PackageManager pm = context.getPackageManager();
+      return pm.getResourcesForApplication(pkg);
+    } catch (PackageManager.NameNotFoundException e) {
+      throw new FileNotFoundException("Unable to obtain resources for package: " + data.uri);
     }
   }
 
+  @TargetApi(HONEYCOMB)
   private static class ActivityManagerHoneycomb {
     static int getLargeMemoryClass(ActivityManager activityManager) {
       return activityManager.getLargeMemoryClass();
@@ -262,21 +409,16 @@ final class Utils {
     }
   }
 
+  @TargetApi(HONEYCOMB_MR1)
   private static class BitmapHoneycombMR1 {
     static int getByteCount(Bitmap bitmap) {
       return bitmap.getByteCount();
     }
   }
 
-  private static class ContactPhotoStreamIcs {
-    static InputStream get(ContentResolver contentResolver, Uri uri) {
-      return openContactPhotoInputStream(contentResolver, uri, true);
-    }
-  }
-
   private static class OkHttpLoaderCreator {
-    static Loader create(Context context) {
-      return new OkHttpLoader(context);
+    static Downloader create(Context context) {
+      return new OkHttpDownloader(context);
     }
   }
 }
